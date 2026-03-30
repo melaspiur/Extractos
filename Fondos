@@ -1,0 +1,248 @@
+
+import re
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+
+import pdfplumber
+import pandas as pd
+
+
+# =========================
+# Utilidades generales
+# =========================
+
+def normalizar_linea(linea: str) -> str:
+    """Compacta espacios repetidos y recorta extremos."""
+    return " ".join(linea.split())
+
+
+def leer_pdf_texto(ruta_pdf: str) -> str:
+    """Extrae todo el texto del PDF."""
+    texto_paginas = []
+    with pdfplumber.open(ruta_pdf) as pdf:
+        for pagina in pdf.pages:
+            texto_paginas.append(pagina.extract_text() or "")
+    return "\n".join(texto_paginas)
+
+
+def exportar_excel(df: pd.DataFrame, ruta_xlsx: str) -> None:
+    """Exporta el DataFrame a Excel."""
+    df.to_excel(ruta_xlsx, index=False)
+
+
+# =========================
+# Parsers
+# =========================
+
+def parse_generico(texto: str):
+    """
+    Formato esperado:
+    12/01/24 DESCRIPCION COMPROBANTE IMPORTE SALDO
+    """
+    patron = re.compile(
+        r"^(\d{2}/\d{2}/\d{2})\s+(.+?)\s+(\S+)\s+([\d\.,]+)\s+([\d\.,]+)$"
+    )
+
+    filas = []
+    for linea in texto.splitlines():
+        linea = normalizar_linea(linea)
+        m = patron.match(linea)
+        if m:
+            filas.append(m.groups())
+
+    columnas = ["fecha", "movimiento", "comprobante", "importe", "saldo"]
+    return filas, columnas
+
+
+def parse_bna(texto: str):
+    """
+    Formato esperado:
+    12/01/24 DESCRIPCION 123456 12.345,67 98.765,43
+    """
+    patron = re.compile(
+        r"^(\d{2}/\d{2}/\d{2})\s+(.+?)\s+(\d+)\s+([\d\.,]+)\s+([\d\.,]+)$"
+    )
+
+    filas = []
+    for linea in texto.splitlines():
+        linea = normalizar_linea(linea)
+        m = patron.match(linea)
+        if m:
+            filas.append(m.groups())
+
+    columnas = ["fecha", "movimiento", "comprobante", "importe", "saldo"]
+    return filas, columnas
+
+
+def agrupar_registros_por_fecha(texto: str):
+    """
+    Para PDFs de fondos:
+    agrupa líneas que arrancan con fecha dd/mm/yyyy y concatena
+    las líneas siguientes hasta la próxima fecha.
+    """
+    registros = []
+    actual = ""
+
+    for linea in texto.splitlines():
+        linea = normalizar_linea(linea)
+        if not linea:
+            continue
+
+        if re.match(r"^\d{2}/\d{2}/\d{4}\b", linea):
+            if actual:
+                registros.append(actual)
+            actual = linea
+        else:
+            if actual:
+                actual += " " + linea
+
+    if actual:
+        registros.append(actual)
+
+    return registros
+
+
+def parse_fondos_bapro(texto: str):
+    """
+    Busca movimientos tipo:
+    02/01/2024 1822 RAICES AHORRO PESOS FNDO4 SUSC 737.621,60 14,70943900 10849999,99
+
+    Columnas:
+    fecha | codigo_especie | descripcion | abreviatura | transaccion | valor_nominal | precio | total
+    """
+    registros = agrupar_registros_por_fecha(texto)
+
+    patron = re.compile(
+        r"^(\d{2}/\d{2}/\d{4})\s+"          # fecha
+        r"(\d+)\s+"                         # codigo especie
+        r"(.+?)\s+"                         # descripcion
+        r"([A-Z0-9]+)\s+"                   # abreviatura
+        r"(SUSC|RESC)\s+"                   # transaccion
+        r"([\d\.,]+)\s+"                    # valor nominal
+        r"([\d\.,]+)\s+"                    # precio
+        r"([\d\.,]+)$"                      # total
+    )
+
+    filas = []
+    for reg in registros:
+        # Filtrar encabezados y basura de página
+        if any(x in reg.upper() for x in [
+            "POSICIÓN CONSOLIDADA",
+            "PÁGINA:",
+            "PAGINA:",
+            "S.E.U.O.",
+            "IMPUESTO CEDULAR",
+            "TÍTULOS",
+            "DEPÓSITOS A PLAZO FIJO",
+            "CONTRATO:",
+            "MONEDA:",
+            "FECHA ESPECIE ABREVIATURA TRANSACCIÓN"
+        ]):
+            continue
+
+        m = patron.match(reg)
+        if m:
+            filas.append(m.groups())
+
+    columnas = [
+        "fecha",
+        "codigo_especie",
+        "descripcion",
+        "abreviatura",
+        "transaccion",
+        "valor_nominal",
+        "precio",
+        "total",
+    ]
+    return filas, columnas
+
+
+# =========================
+# Motores disponibles
+# =========================
+
+PARSERS = {
+    "Genérico": parse_generico,
+    "Banco Nación": parse_bna,
+    "Fondos BAPRO": parse_fondos_bapro,
+}
+
+
+# =========================
+# Proceso principal
+# =========================
+
+def procesar():
+    ruta_pdf = filedialog.askopenfilename(
+        title="Seleccionar PDF",
+        filetypes=[("PDF", "*.pdf")]
+    )
+    if not ruta_pdf:
+        return
+
+    motor = combo.get()
+    parser = PARSERS.get(motor)
+
+    if parser is None:
+        messagebox.showerror("Error", "Motor no válido.")
+        return
+
+    try:
+        texto = leer_pdf_texto(ruta_pdf)
+
+        if not texto.strip():
+            messagebox.showwarning("Sin texto", "No se pudo extraer texto del PDF.")
+            return
+
+        filas, columnas = parser(texto)
+
+        if not filas:
+            messagebox.showwarning(
+                "Sin resultados",
+                f"No se encontraron movimientos con el motor: {motor}"
+            )
+            return
+
+        df = pd.DataFrame(filas, columns=columnas)
+
+        ruta_xlsx = filedialog.asksaveasfilename(
+            title="Guardar Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")]
+        )
+        if not ruta_xlsx:
+            return
+
+        exportar_excel(df, ruta_xlsx)
+
+        messagebox.showinfo(
+            "OK",
+            f"Archivo generado correctamente.\n\nRegistros exportados: {len(df)}"
+        )
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Ocurrió un problema:\n\n{e}")
+
+
+# =========================
+# Interfaz
+# =========================
+
+root = tk.Tk()
+root.title("PDF a Excel")
+root.geometry("360x170")
+root.resizable(False, False)
+
+ttk.Label(root, text="Elegí el motor de lectura:").pack(padx=20, pady=(20, 8))
+
+combo = ttk.Combobox(root, values=list(PARSERS.keys()), state="readonly")
+combo.set("Banco Nación")
+combo.pack(padx=20, pady=5)
+
+ttk.Button(
+    root,
+    text="Seleccionar PDF / Procesar / Exportar",
+    command=procesar
+).pack(padx=20, pady=25)
+
+root.mainloop()
